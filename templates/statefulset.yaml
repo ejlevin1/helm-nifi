@@ -1,4 +1,6 @@
 ---
+
+{{- $listenPort := (default .Values.properties.httpsPort .Values.properties.httpPort) -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -158,6 +160,7 @@ spec:
 {{- end }}
 
           if ! test -f /opt/nifi/data/flow.xml.gz && test -f /opt/nifi/data/flow.xml; then
+            echo "Generating /opt/nifi/data/flow.xml.gz from /opt/nifi/data/flow.xml"
             gzip /opt/nifi/data/flow.xml
           fi
 
@@ -173,6 +176,7 @@ spec:
           prop_replace nifi.web.proxy.host {{ template "apache-nifi.fullname" . }}.{{ .Release.Namespace }}.svc
 {{- end }}
 
+{{- if not .Values.properties.httpPort }}
           if [ ! -r "${NIFI_HOME}/conf/nifi-cert.pem" ]
           then
             /opt/nifi/nifi-toolkit-current/bin/tls-toolkit.sh standalone \
@@ -183,19 +187,21 @@ spec:
               -S {{.Values.auth.SSL.keystorePasswd}} \
               --nifiPropertiesFile /opt/nifi/nifi-current/conf/nifi.properties
           fi
+{{- end }}
 
 {{- if .Values.properties.safetyValve }}
   {{- range $prop, $val := .Values.properties.safetyValve }}
           prop_replace {{ $prop }} "{{ $val }}" nifi.properties
   {{- end }}
 {{- end }}
-
-          for f in "${NIFI_HOME}/conf/authorizers.xml" "${NIFI_HOME}/conf/login-identity-providers.xml" ${NIFI_HOME}/conf/nifi.properties
-          do
-            echo === $f ===
-            cat $f
-          done
-          echo === end of files ===
+          if [ "${NIFI_DEBUG_CONFIG}" = "true" ] ; then
+            for f in "${NIFI_HOME}/conf/authorizers.xml" "${NIFI_HOME}/conf/login-identity-providers.xml" ${NIFI_HOME}/conf/nifi.properties
+            do
+              echo === $f ===
+              cat $f
+            done
+            echo === end of files ===
+          fi
 
           function prop () {
             target_file=${NIFI_HOME}/conf/nifi.properties
@@ -205,8 +211,11 @@ spec:
           function offloadNode() {
               FQDN=$(hostname -f)
               echo "disconnecting node '$FQDN'"
-              baseUrl=https://${FQDN}:{{ .Values.properties.httpsPort }}
+              baseUrl=https://${FQDN}:{{ $listenPort }}
 
+              {{ if .Values.properties.httpPort }}
+              secureArgs=""
+              {{ else }}
               echo "keystoreType=$(prop nifi.security.keystoreType)" > secure.properties
               echo "keystore=$(prop nifi.security.keystore)" >> secure.properties
               echo "keystorePasswd=$(prop nifi.security.keystorePasswd)" >> secure.properties
@@ -214,8 +223,8 @@ spec:
               echo "truststore=$(prop nifi.security.truststore)" >> secure.properties
               echo "truststorePasswd=$(prop nifi.security.truststorePasswd)" >> secure.properties
               echo "proxiedEntity={{ .Values.auth.admin }}" >> secure.properties
-             
               secureArgs="-p secure.properties"
+              {{ end }}
 
               echo baseUrl ${baseUrl}
               echo "gracefully disconnecting node '$FQDN' from cluster"
@@ -226,7 +235,7 @@ spec:
               echo ""
               echo "get a connected node"
               connectedNode=$(jq -r 'first(.cluster.nodes|=sort_by(.address)| .cluster.nodes[] | select(.status=="CONNECTED")) | .address' nodes.json)
-              baseUrl=https://${connectedNode}:{{ .Values.properties.httpsPort }}
+              baseUrl=https://${connectedNode}:{{ $listenPort }}
               echo baseUrl ${baseUrl}
               echo ""
               echo "wait until node has state 'DISCONNECTED'"
@@ -271,22 +280,17 @@ spec:
           name: metrics
           protocol: TCP                  
 {{- end }}
-        - containerPort: {{ .Values.properties.httpsPort }}
-{{- if .Values.sts.hostPort }}
-          hostPort: {{ .Values.sts.hostPort }}
-{{- end }}
-          name: https
+        - containerPort: {{ $listenPort }}
           protocol: TCP
+          {{- if .Values.sts.hostPort }}
+          hostPort: {{ .Values.sts.hostPort }}
+          {{- end }}
         - containerPort: {{ .Values.properties.clusterPort }}
           name: cluster
           protocol: TCP
         env:
         - name: NIFI_ZOOKEEPER_CONNECT_STRING
           value: {{ template "zookeeper.url" . }}
-{{- if not (or (.Values.auth.ldap.enabled) (.Values.auth.oidc.enabled)) }}
-        - name: NIFI_WEB_HTTPS_HOST
-          value: 0.0.0.0
-{{- end }}
 {{- if .Values.env }}
 {{ toYaml .Values.env | indent 8 }}
 {{- end }}
@@ -307,7 +311,7 @@ spec:
 {{- end }}
           periodSeconds: 20
           tcpSocket:
-            port: {{ .Values.properties.httpsPort }}
+            port: {{ $listenPort }}
 #           exec:
 #             command:
 #             - bash
@@ -335,7 +339,7 @@ spec:
           failureThreshold: {{ .Values.sts.startupProbe.failureThreshold }}
           periodSeconds: {{ .Values.sts.startupProbe.periodSeconds }}
           tcpSocket:
-            port: {{ .Values.properties.httpsPort }}
+            port: {{ $listenPort }}
 {{- end }}
         livenessProbe:
 {{- if not .Values.sts.startupProbe.enabled }}
@@ -343,7 +347,7 @@ spec:
 {{- end }}
           periodSeconds: 60
           tcpSocket:
-            port: {{ .Values.properties.httpsPort }}
+            port: {{ $listenPort }}
         volumeMounts:
           - name: "logs"
             mountPath: /opt/nifi/nifi-current/logs
@@ -517,6 +521,8 @@ spec:
         emptyDir: {}
       - name: provenance-repository
         emptyDir: {}
+{{- end }}
+{{- if not .Values.persistence.logStorage.enabled }}
       - name: logs
         emptyDir: {}
 {{- end }}
@@ -525,6 +531,7 @@ spec:
 {{- end }}
 {{- if .Values.persistence.enabled }}
   volumeClaimTemplates:
+{{- if .Values.persistence.logStorage.enabled }}
     - metadata:
         name: logs
       spec:
@@ -532,15 +539,23 @@ spec:
         {{- range .Values.persistence.accessModes }}
           - {{ . | quote }}
         {{- end }}
+        {{- if .Values.persistence.storageClass }}
         storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- end }}
         resources:
           requests:
             storage: {{ .Values.persistence.logStorage.size }}
+{{- end }}
     - metadata:
-        name: "config-data"
+        name: config-data
       spec:
-        accessModes: ["ReadWriteOnce"]
+        accessModes:
+        {{- range .Values.persistence.accessModes }}
+          - {{ . | quote }}
+        {{- end }}
+        {{- if .Values.persistence.storageClass }}
         storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- end }}
         resources:
           requests:
             storage: {{ .Values.persistence.configStorage.size }}
@@ -551,7 +566,9 @@ spec:
         {{- range .Values.persistence.accessModes }}
           - {{ . | quote }}
         {{- end }}
+        {{- if .Values.persistence.storageClass }}
         storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- end }}
         resources:
           requests:
             storage: {{ .Values.persistence.dataStorage.size }}
@@ -562,7 +579,9 @@ spec:
         {{- range .Values.persistence.accessModes }}
           - {{ . | quote }}
         {{- end }}
+        {{- if .Values.persistence.storageClass }}
         storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- end }}
         resources:
           requests:
             storage: {{ .Values.persistence.flowfileRepoStorage.size }}
@@ -573,7 +592,9 @@ spec:
         {{- range .Values.persistence.accessModes }}
           - {{ . | quote }}
         {{- end }}
+        {{- if .Values.persistence.storageClass }}
         storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- end }}
         resources:
           requests:
             storage: {{ .Values.persistence.contentRepoStorage.size }}
@@ -584,7 +605,9 @@ spec:
         {{- range .Values.persistence.accessModes }}
           - {{ . | quote }}
         {{- end }}
+        {{- if .Values.persistence.storageClass }}
         storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- end }}
         resources:
           requests:
             storage: {{ .Values.persistence.provenanceRepoStorage.size }}
@@ -595,7 +618,9 @@ spec:
         {{- range .Values.persistence.accessModes }}
           - {{ . | quote }}
         {{- end }}
+        {{- if .Values.persistence.storageClass }}
         storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- end }}
         resources:
           requests:
             storage: {{ .Values.persistence.authconfStorage.size }}

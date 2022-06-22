@@ -2,7 +2,8 @@
 {{- if .Values.ingress.enabled -}}
 {{- $fullName := include "apache-nifi.fullname" . -}}
 {{- $ingressPath := .Values.ingress.path -}}
-{{- $ingressHttpsPort := .Values.service.httpsPort -}}
+{{- $pathType := default "Prefix" .Values.ingress.pathType -}}
+{{- $ingressPort := (default .Values.service.httpsPort .Values.service.httpPort) -}}
 apiVersion: extensions/v1beta1
 kind: Ingress
 metadata:
@@ -34,8 +35,9 @@ spec:
       http:
         paths:
           - path: {{ $ingressPath }}
+            pathType: {{ $pathType }}
             backend:
               serviceName: {{ $fullName }}
-              servicePort: {{ $ingressHttpsPort }}
+              servicePort: {{ $ingressPort }}
   {{- end }}
 {{- end }}
